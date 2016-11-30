@@ -1,0 +1,138 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure(2) do |config|
+
+  config.vm.box = "ubuntu/trusty64"
+  config.vm.box_check_update = false
+  config.vm.hostname = 'PyMI-vagrant'
+  config.vm.network "private_network", type: "dhcp"
+
+  # Sync vm folder to current Vagrantfile path
+  config.vm.synced_folder '.', '/my_project', nfs: true
+
+  # PostgreSQL
+  config.vm.network "forwarded_port", guest: 5432, host: 54321
+
+  # APP via nginx
+  config.vm.network "forwarded_port", guest: 8080, host: 8888
+
+  # APP via uwsgi
+  config.vm.network "forwarded_port", guest: 8081, host: 7777
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = "2048"
+    vb.name = "Python Milano"
+  end
+
+  $script = <<SCRIPT
+#!/bin/bash
+
+echo "Distro packages update"
+sudo apt-get update
+sudo apt-get upgrade -y
+sudo apt-get install -y python-virtualenv virtualenvwrapper git mercurial build-essential python-dev zlib1g-dev \
+zlib1g zlibc libtool libffi-dev libssl-dev libpq-dev libgeoip-dev libxml2-dev libxslt1-dev libbz2-dev \
+libsqlite3-dev libreadline-dev libjpeg-dev postgresql postgresql-contrib postgresql-client htop nginx wget unzip \
+libpcre3 libpcre3-dev openjdk-7-jre
+
+echo "Configuring nginx"
+NGNIX_CONF="/etc/nginx/sites-available/vmvagrant"
+printf 'server {\n\tlisten 8080;\n\t\tlocation / {\n\t\t\tuwsgi_pass 127.0.0.1:3031;\n\t\t\tinclude uwsgi_params;\n\t\t}\n}\n' > "$NGNIX_CONF"
+rm -f /etc/nginx/sites-enabled/vmvagrant
+ln -s /etc/nginx/sites-available/vmvagrant /etc/nginx/sites-enabled
+
+echo "Installing uwsgi"
+sudo pip install uwsgi
+
+echo "Configuring uwsgi"
+mkdir -p /home/vagrant/vassals
+mkdir -p /home/vagrant/logs
+chown vagrant:vagrant /home/vagrant/vassals
+chown vagrant:vagrant /home/vagrant/logs
+UWSGI_CONF="/etc/init/uwsgi.conf"
+printf '%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n' 'description "uWSGI application server in Emperor mode"' \
+'start on runlevel [2345]' \
+'stop on runlevel [!2345]' \
+'setuid vagrant' \
+'setgid www-data' \
+'exec /usr/local/bin/uwsgi --emperor /home/vagrant/vassals' > "$UWSGI_CONF"
+
+service nginx restart
+
+echo "Starting services uwsgi"
+service uwsgi start
+
+echo "Installing elasticsearch"
+if [ ! -d "/home/vagrant/elasticsearch-1.6.0" ]; then
+    wget -nv https://download.elastic.co/elasticsearch/elasticsearch/elasticsearch-1.6.0.zip -P /home/vagrant
+    unzip -o -qq /home/vagrant/elasticsearch-1.6.0.zip -d /home/vagrant
+    chown -R vagrant:vagrant /home/vagrant/elasticsearch-1.6.0
+    rm /home/vagrant/elasticsearch-1.6.0.zip
+    echo "Creating vassal for startup"
+    printf 'PID_FILE=/tmp/elasticsearch.pid\n/home/vagrant/elasticsearch-1.6.0/bin/elasticsearch -d -p $PID_FILE' > /home/vagrant/es-service-start.sh
+    chmod +x /home/vagrant/es-service-start.sh
+    chown vagrant:vagrant /home/vagrant/es-service-start.sh
+    printf '[uwsgi]\nsmart-attach-daemon = /tmp/elasticsearch.pid /home/vagrant/es-service-start.sh\nlogto = /home/vagrant/logs/elasticsearch.log\nlog-maxsize = 10000000' > /home/vagrant/vassals/elasticsearch.ini
+    chown vagrant:vagrant /home/vagrant/vassals/elasticsearch.ini
+    echo "curl -XPOST 'http://0.0.0.0:9200/_shutdown?pretty'" > /home/vagrant/es-service-stop.sh
+    chmod +x /home/vagrant/es-service-stop.sh
+    chown vagrant:vagrant /home/vagrant/es-service-stop.sh
+else
+    echo "Elasticsearch already provisioned"
+fi
+
+sudo -u vagrant touch /home/vagrant/vassals/elasticsearch.ini
+
+BASHRC="/home/vagrant/.bashrc"
+# Remove lines from .bashrc on provisioning reloaded
+sed -i '115,125d' $BASHRC
+echo "Configuring virtualenvwrapper ..."
+printf '\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' 'export PIP_REQUIRE_VIRTUALENV=true' \
+'export WORKON_HOME=$HOME/.virtualenvs' \
+'export PROJECT_HOME=/vagrant' \
+'export VIRTUALENVWRAPPER_PYTHON=/usr/bin/python' \
+'export VIRTUALENVWRAPPER_VIRTUALENV=/usr/bin/virtualenv' \
+'source /usr/share/virtualenvwrapper/virtualenvwrapper.sh' >> "$BASHRC"
+
+echo "Setting aliases"
+echo "alias pipssl='pip install -U pip pyopenssl'" >> "$BASHRC"
+echo "alias pip-outdated='pip list --outdated'"
+
+echo "Python environment settings"
+echo "export PYTHONDONTWRITEBYTECODE=true" >> /home/vagrant/.bashrc
+echo "rmpyc='find . -type f -name "*.pyc" -print -delete'" >> "$BASHRC"
+
+echo "Configuring PostgreSQL"
+PG_CONF="/etc/postgresql/9.3/main/postgresql.conf"
+PG_HBA="/etc/postgresql/9.3/main/pg_hba.conf"
+
+echo "listen_addresses = '*'" >> "$PG_CONF"
+echo "client_encoding = utf8" >> "$PG_CONF"
+echo "host    all             all             all                     md5" >> "$PG_HBA"
+echo "======================================================================"
+echo "| Remember to configure PostgreSQL                                   |"
+echo "======================================================================"
+echo "In a terminal type:"
+echo "$ sudo -u postgres psql postgres"
+echo "Set a password for the postgres database role using the command:"
+echo "psql# \password postgres"
+echo "Then exit and grant all to vagrant user"
+echo "sudo -u postgres createuser --superuser vagrant"
+echo "======================================================================"
+echo "Create an $USER"
+echo "======================================================================"
+echo "$ sudo -u postgres createuser --superuser $USER"
+echo "$ sudo -u postgres psql"
+echo "postgres=# \password $USER"
+echo "Doc: https://help.ubuntu.com/community/PostgreSQL"
+echo "======================================================================"
+echo "$ sudo service postgresql restart"
+echo "======================================================================"
+echo "Help: https://help.ubuntu.com/community/PostgreSQL"
+echo "======================================================================"
+SCRIPT
+
+  config.vm.provision "shell", inline: $script
+
+end
