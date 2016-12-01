@@ -122,7 +122,6 @@ def release():
     Utile da far girare prima del deploy
     :return:
     """
-    add2virtualenv()
     wipeenv()
     _update_pip_setuptools()
     requirements()
